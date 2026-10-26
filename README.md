@@ -353,6 +353,37 @@ node check-compat.js "/Applications/Typora.app/Contents/Resources/app.asar"
    若两个 N 都是正数却仍显示 0 天，说明有第三个来源，请把日志反馈出来。
 3. 删掉 `unlock.state.json` 可以让补丁重新锚定。
 
+### 关窗口后进程不退（残留多个 Typora.exe）
+
+**先看是不是补丁的问题。** 用任务管理器看残留进程数：
+
+| 情况 | 说明 |
+|---|---|
+| 5 个 → 0 个（8 秒内） | ✅ 正常，watchdog 生效 |
+| 5 个 → 4 个，一直不降 | ⚠️ watchdog 没生效，看下面 |
+| 一直是 5 个 | 窗口没关掉，或补丁未加载 |
+
+排查步骤：
+
+1. 看 `%APPDATA%\Typora\unlock.log`，搜索 `watchdog`：
+   ```
+   watchdog: 无可见窗口 (1/3)
+   watchdog: 无可见窗口 (2/3)
+   watchdog: 无可见窗口 (3/3)
+   watchdog: 强制退出
+   ```
+   有这四行说明正常触发了。
+
+2. 如果日志里没有 `watchdog`，说明 `unlock.js` 没加载：
+   - 检查 `resources\app\package.json` 的 `main` 是否为 `unlock.js`
+   - 检查 `resources\app\unlock.js` 是否存在
+
+3. 如果日志里有 `blocked startup auto-quit` 但后面没有 `quit allowed`，
+   说明被拦截后没放行——这是旧版本的 bug，更新到最新 `unlock.js` 即可。
+
+**注意**：Typora 1.14.15 原版本身就退不干净，需要两次 Alt+F4。
+补丁的 watchdog 反而修复了这个问题。
+
 ### 想彻底回到原版
 
 ```bash
@@ -437,6 +468,37 @@ Typora 的完整性校验（日志里的 `[LC] p`）只检查 `LicenseIndex.js` 
 | `onUnfillLicense` | 验签失败时清空 `SLicense` | 不影响试用期 |
 
 **未发现**：定时回传、设备指纹上报、功能降级、数据损坏。
+
+### 退出行为（重要）
+
+Typora 1.14.15 自身有个怪行为：**关窗口后进程不退**，需要再按一次 Alt+F4 才真正退出。
+实测原版（未打补丁）：
+
+```
+启动后: 5 个进程
+第 1 次 Alt+F4 → 4 个进程（窗口关了，进程残留）
+第 2 次 Alt+F4 → 0 个进程
+```
+
+原因在 `atom.compiled.dist.jsc` 的 `before-quit` 处理里调了 `app.cancelQuit()`。
+
+**补丁已修正这个问题**，加了 watchdog：
+
+```
+启动后: 5 个
+发送 WM_CLOSE
+watchdog: 无可见窗口 (1/3)
+watchdog: 无可见窗口 (2/3)
+watchdog: 无可见窗口 (3/3)
+watchdog: 强制退出
+关闭 8 秒后: 0 个     ← 一次就退干净
+```
+
+逻辑：启动 10 秒后开始检查，连续 3 秒无可见窗口就强制退出。
+
+> 早期版本有个更严重的 bug：`app.quit` 拦截用调用栈正则判断，
+> 导致用户主动退出也被拦，进程永远不退。现在改成
+> **只拦启动后 8 秒内的第一次**，之后一律放行。
 
 ### 刷新策略（低痕迹设计）
 

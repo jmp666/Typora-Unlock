@@ -204,16 +204,71 @@ function writeState(o) {
   }
 })();
 
-// ---------- 1. 阻止 jsc 内部的自动退出 ----------
-const _quit = electron.app.quit.bind(electron.app);
-electron.app.quit = function () {
-  const st = new Error().stack || "";
-  if (/\.jsc|atom\.compiled|launch\.dist/.test(st)) {
-    log("blocked auto-quit");
-    return;
-  }
-  return _quit();
-};
+// ---------- 1. 阻止 jsc 内部的自动退出（仅启动阶段，且只拦一次） ----------
+//
+// 背景：试用期到期时，jsc 会在启动后 ~1s 调一次 app.quit()。
+// 旧实现用调用栈正则判断，但用户点「退出」/关窗口时，
+// 调用栈同样会经过 atom.compiled.dist.jsc（菜单和窗口处理都在里面），
+// 导致正常退出也被拦 → 窗口关了进程不退。
+//
+// 新实现：
+//   - 只拦「启动后 8 秒内的第一次」quit，拦完立即失效
+//   - 之后所有 quit 一律放行
+//   - 另加 watchdog：所有窗口都销毁后若进程仍存活，强制退出
+(function guardStartupQuit() {
+  const START = Date.now();
+  const WINDOW_MS = 8000;
+  let blocked = 0;
+
+  const _quit = electron.app.quit.bind(electron.app);
+  const _exit = electron.app.exit.bind(electron.app);
+
+  electron.app.quit = function () {
+    const elapsed = Date.now() - START;
+    if (blocked === 0 && elapsed < WINDOW_MS) {
+      blocked++;
+      log(`blocked startup auto-quit (t=${elapsed}ms, 仅此一次)`);
+      return;
+    }
+    log(`quit allowed (t=${elapsed}ms, 已拦 ${blocked} 次)`);
+    return _quit();
+  };
+
+  // 兜底 1：标准事件
+  electron.app.on("window-all-closed", () => {
+    log("window-all-closed → 退出进程");
+    try { _quit(); } catch (e) {}
+    setTimeout(() => { try { _exit(0); } catch (e) { process.exit(0); } }, 800);
+  });
+
+  // 兜底 2：watchdog —— Typora 1.14.15 的 cancelQuit 机制
+  // 会让「关窗口」不触发 window-all-closed，进程残留。
+  // 这里定期检查：若没有任何可见窗口，且启动已过 10 秒，就退出。
+  let deadTicks = 0;
+  const timer = setInterval(() => {
+    if (Date.now() - START < 10000) return;
+    let visible = 0;
+    try {
+      visible = electron.BrowserWindow.getAllWindows().filter((w) => {
+        try { return w.isVisible() && !w.isDestroyed(); } catch (e) { return false; }
+      }).length;
+    } catch (e) { return; }
+
+    if (visible === 0) {
+      deadTicks++;
+      log(`watchdog: 无可见窗口 (${deadTicks}/3)`);
+      if (deadTicks >= 3) {
+        clearInterval(timer);
+        log("watchdog: 强制退出");
+        try { _quit(); } catch (e) {}
+        setTimeout(() => { try { _exit(0); } catch (e) { process.exit(0); } }, 500);
+      }
+    } else {
+      deadTicks = 0;
+    }
+  }, 1000);
+  if (timer.unref) timer.unref();
+})();
 
 // ---------- 2. 抑制激活弹窗 ----------
 const BW = electron.BrowserWindow;
