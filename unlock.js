@@ -296,13 +296,71 @@ for (const m of ["show", "showInactive"]) {
   };
 }
 
-// ---------- 2b. 关闭自动更新检查 ----------
-// 实测：Typora 的自动更新检查不受 hasLicense 影响，
-//       frame.js 里 upgradePolicy="none" 只是 Analytics 上报字段。
-//       真正触发检查的是主进程 updater，所以这里直接把它停掉。
+// ---------- 2b. 彻底禁用自动更新 ----------
+//
+// 【2026-10-27 事故复盘】
+// 旧实现只拦了 ipcMain.handle('updater.*')，但 Typora 内部走的是
+// 直接调用，绕过了 IPC，所以 checkForUpdates 照样执行。
+// 结果：更新器被部分触发，删了旧 Typora.exe 却没写完新文件，
+//       叠加系统断电 → 主程序丢失。
+//
+// 【真正的拦截点】
+// jsc 里启动更新器的唯一出口是 Node 的 child_process：
+//     spawn(installPath, ['/SILENT'], { stdio: 'ignore' }).unref()
+// 拦死 child_process，更新器就永远起不来。
+//
+// 【三层防护】
+//   L1  child_process.spawn/exec/execFile/fork  → 拦
+//   L2  updater.* IPC                            → 返回 null
+//   L3  清理已下载的更新包 + 写入 enableAutoUpdate=false
 (function disableUpdater() {
+  const cp = require("child_process");
+  const pathMod = require("path");
+
+  // 判断是否是 Typora 更新器（避免误伤其它子进程）
+  const isUpdaterCmd = (cmd, args) => {
+    try {
+      const s = (String(cmd) + " " + (Array.isArray(args) ? args.join(" ") : "")).toLowerCase();
+      if (/typora[-\s]?(update|setup)/.test(s)) return true;
+      if (/[\\/]typora\.exe$/i.test(String(cmd)) && /\/silent/i.test(s)) return true;
+      if (/[\\/]unins\d+\.exe$/i.test(String(cmd))) return true;
+      if (/[\\/]temp[\\/]typora[\\/]/.test(s)) return true;
+      return false;
+    } catch (e) { return false; }
+  };
+
+  // L1：拦所有子进程启动方式
+  const blocked = { spawn: 0, exec: 0, execFile: 0, fork: 0, spawnSync: 0, execSync: 0, execFileSync: 0 };
+
+  for (const fn of ["spawn", "exec", "execFile", "fork", "spawnSync", "execSync", "execFileSync"]) {
+    const orig = cp[fn];
+    if (typeof orig !== "function") continue;
+    cp[fn] = function (cmd, ...rest) {
+      const args = rest[0];
+      if (isUpdaterCmd(cmd, args)) {
+        blocked[fn]++;
+        log(`[UPD-BLOCK] ${fn}(${pathMod.basename(String(cmd))}) 已拦截`);
+        // 同步版本要返回合法的空结果，避免调用方崩
+        if (fn === "spawnSync" || fn === "execSync" || fn === "execFileSync") {
+          return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), pid: 0, output: [null, Buffer.alloc(0), Buffer.alloc(0)] };
+        }
+        // 异步版本返回一个假的 EventEmitter，避免 .on()/.unref() 报错
+        const { EventEmitter } = require("events");
+        const fake = new EventEmitter();
+        fake.unref = () => fake;
+        fake.ref = () => fake;
+        fake.kill = () => true;
+        fake.pid = -1;
+        fake.stdin = null; fake.stdout = null; fake.stderr = null;
+        return fake;
+      }
+      return orig.apply(this, arguments);
+    };
+  }
+  log("child_process hooked: " + Object.keys(blocked).join(","));
+
+  // L2：IPC 层（保留，作为第二道）
   try {
-    // 拦截 IPC：任何 updater.* 调用直接返回，不发起网络请求
     const _origHandle = electron.ipcMain.handle.bind(electron.ipcMain);
     electron.ipcMain.handle = function (ch, fn) {
       if (/^updater\./i.test(ch)) {
@@ -311,30 +369,59 @@ for (const m of ["show", "showInactive"]) {
       }
       return _origHandle(ch, fn);
     };
+  } catch (e) { log("ipc hook err: " + e.message); }
 
-    // 拦截菜单里的 "Check Updates..."，改为无操作
-    electron.app.on("browser-window-created", (_e, win) => {
-      const _setMenu = win.setMenu;
-      if (typeof _setMenu !== "function") return;
-      win.setMenu = function (menu) {
-        try {
-          const walk = (m) => {
-            if (!m) return;
-            for (const it of (m.items || [])) {
-              const lbl = String(it.label || "");
-              if (/check\s*updates?|检查更新/i.test(lbl)) {
-                it.click = () => log("blocked menu: " + lbl);
-                log("patched menu item: " + lbl);
-              }
-              if (it.submenu) walk(it.submenu);
+  // L3a：清理已下载的更新包（防止下次启动直接装）
+  try {
+    const tmpDir = pathMod.join(process.env.LOCALAPPDATA || "", "Temp", "Typora");
+    if (fs.existsSync(tmpDir)) {
+      for (const f of fs.readdirSync(tmpDir)) {
+        if (/typora[-\s]?update.*\.exe$/i.test(f)) {
+          try {
+            fs.unlinkSync(pathMod.join(tmpDir, f));
+            log("[UPD-BLOCK] 已删除更新包 " + f);
+          } catch (e) { log("删除更新包失败: " + e.message); }
+        }
+      }
+    }
+  } catch (e) {}
+
+  // L3b：写入 enableAutoUpdate=false（Typora 自己的开关）
+  try {
+    const pf = pathMod.join(process.env.APPDATA || "", "Typora", "profile.data");
+    if (fs.existsSync(pf)) {
+      const j = JSON.parse(Buffer.from(fs.readFileSync(pf, "utf8").trim(), "hex").toString("utf8"));
+      if (j.enableAutoUpdate !== false) {
+        j.enableAutoUpdate = false;
+        fs.writeFileSync(pf, Buffer.from(JSON.stringify(j), "utf8").toString("hex"), "ascii");
+        log("[UPD-BLOCK] profile.data: enableAutoUpdate=false");
+      }
+    }
+  } catch (e) { log("写 enableAutoUpdate 失败: " + e.message); }
+
+  // L3c：拦截菜单项
+  electron.app.on("browser-window-created", (_e, win) => {
+    const _setMenu = win.setMenu;
+    if (typeof _setMenu !== "function") return;
+    win.setMenu = function (menu) {
+      try {
+        const walk = (m) => {
+          if (!m) return;
+          for (const it of (m.items || [])) {
+            const lbl = String(it.label || "");
+            if (/check\s*updates?|检查更新/i.test(lbl)) {
+              it.click = () => log("blocked menu: " + lbl);
+              it.enabled = false;
+              log("disabled menu item: " + lbl);
             }
-          };
-          walk(menu);
-        } catch (e) {}
-        return _setMenu.apply(this, arguments);
-      };
-    });
-  } catch (e) { log("disableUpdater err: " + e.message); }
+            if (it.submenu) walk(it.submenu);
+          }
+        };
+        walk(menu);
+      } catch (e) {}
+      return _setMenu.apply(this, arguments);
+    };
+  });
 })();
 
 // ---------- 3. 接管注入脚本与 license URL ----------

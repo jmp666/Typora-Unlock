@@ -47,9 +47,9 @@ Typora 主窗口能否创建，取决于**试用期剩余天数 > 0**，而不�
 - 不能生成真实的授权码（需要 Typora 的 RSA 私钥）
 - 不能把主进程内部的 `hasL` 改成 `true`（该变量封装在 V8 字节码闭包里）
 
-### 关于自动更新（重要更正）
+### 关于自动更新（两次更正）
 
-**早期版本的说法是错的。** 之前写"`hasL=false` 会自动禁用更新"，那是**从 `upgradePolicy` 字段推断**的，未经验证。
+**第一次更正**：早期写"`hasL=false` 会自动禁用更新"，那是从 `upgradePolicy` 字段推断的，未经验证。
 
 实测真相：
 
@@ -63,21 +63,96 @@ File.option.hasLicense
 但 `upgradePolicy` **只是 Analytics 上报字段**，不控制实际行为。
 真正触发更新检查的是主进程的 `updater.checkForUpdates`，它**完全不看 `hasLicense`**。
 
-实测证据：未打补丁的原版 Typora（`hasLicense=false`）照样弹「有新版本更新 1.14.15」。
+---
 
-**因此补丁现在会主动拦截更新**：
+**第二次更正（2026-10-27 事故）**：上一版补丁只拦了 `ipcMain.handle('updater.*')`，
+**拦不住**。因为 Typora 内部走的是直接调用，绕过 IPC。
+
+后果很严重：更新器被部分触发 → 删了旧 `Typora.exe` → 没写完新文件 → 系统断电 → **主程序丢失**。
+
+#### 真正的拦截点
+
+从 `atom.compiled.dist.jsc` 反出的代码：
+
+```js
+// Typora 启动更新器的唯一出口
+spawn(installPath, ["/SILENT"], { stdio: "ignore" }).unref()
+```
+
+`unref()` 意味着更新器**脱离父进程独立运行**，Typora 不等它完成。
+所以在它删文件、写文件的过程中断电，就会留下半完成状态。
+
+#### 现在的三层防护
+
+**L1 — 拦 `child_process`（核心）**
+
+```js
+for (const fn of ["spawn","exec","execFile","fork","spawnSync","execSync","execFileSync"]) {
+  cp[fn] = function (cmd, ...rest) {
+    if (isUpdaterCmd(cmd, rest[0])) {
+      log(`[UPD-BLOCK] ${fn}(${basename(cmd)}) 已拦截`);
+      // 异步返回假 EventEmitter（pid=-1），同步返回空结果
+      return fake;
+    }
+    return orig.apply(this, arguments);
+  };
+}
+```
+
+拦截规则（不误伤正常程序）：
+
+| 匹配 | 说明 |
+|---|---|
+| `typora-update*` / `typora-setup*` | 更新包 / 安装包 |
+| `Typora.exe /SILENT` | 静默安装 |
+| `unins*.exe` | 卸载程序 |
+| `\Temp\Typora\` | 更新包目录 |
+
+**L2 — IPC 层**（保留作为第二道）
+`updater.*` 全部返回 `null`。
+
+**L3 — 清理与开关**
+- 删除已下载的更新包
+- `profile.data` 写入 `enableAutoUpdate: false`
+- 菜单「检查更新…」置灰
+
+#### 实测结果
 
 ```
+child_process hooked: spawn,exec,execFile,fork,spawnSync,execSync,execFileSync
+[UPD-BLOCK] 已删除更新包 typora-update-x64-9.9.9.exe
+[UPD-BLOCK] profile.data: enableAutoUpdate=false
 disabled IPC updater.checkForUpdates
-disabled IPC updater.cancelUpdate
-disabled IPC updater.skipUpdate
-disabled IPC updater.downloadUpdate
-patched menu item: 检查更新…
-suppressed updater window (show)
+disabled menu item: 检查更新…
 ```
 
-> 想保留自动更新，把 `unlock.js` 里的 `UPD_SILENT` 改为 `false`，
-> 并注释掉 `disableUpdater()` 那一段。
+主动测试 spawn 拦截：
+
+| 测试 | 结果 |
+|---|---|
+| spawn 更新包 | `pid=-1` 已拦截 ✅ |
+| spawn 卸载程序 | `pid=-1` 已拦截 ✅ |
+| spawn `cmd.exe`（正常命令） | `pid=23168` 放行 ✅ |
+| `unref()` 调用 | 正常不报错 ✅ |
+
+功能未受影响：
+
+```
+STATE {"hasLicense":true,"editorReady":true,"banner":0}
+PDF 18777 bytes
+installDate is 10/26/2026, trail remains: 15
+关闭后: 0 个进程
+```
+
+#### 更强的做法：直接从源头关掉
+
+**推荐同时做这一步**，比补丁拦截更彻底：
+
+打开 Typora → 偏好设置 → 通用 → 取消勾选「自动检查更新」
+
+补丁的 `enableAutoUpdate: false` 会自动帮你做这件事，但如果你重装了 Typora，需要重新执行补丁。
+
+> 想保留自动更新，把 `unlock.js` 里的 `disableUpdater()` 整段注释掉即可。
 
 ---
 
